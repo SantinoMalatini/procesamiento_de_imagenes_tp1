@@ -85,7 +85,7 @@ if __name__ == '__main__':
     }
     
     ventanas_cuadradas = [(3, 3), (5, 5), (7, 7), (11, 11), (15, 15), (31, 31)]
-    ventanas_rectangulares = [(3, 5), (5, 3), (3, 15), (3, 15), (5, 31), (31, 5)]
+    ventanas_rectangulares = [(3, 5), (5, 3), (3, 15), (15, 3), (5, 31), (31, 5)]
 
     # Exploramos cada técnica de borde
     for nombre_borde, tipo_borde in tecnicas_bordes.items():
