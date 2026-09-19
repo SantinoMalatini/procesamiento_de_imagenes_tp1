@@ -1,25 +1,13 @@
-import os
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 
-# Clave de respuestas correctas (pregunta 1 a 10)
+# --- Respuestas correctas -------------------------------------------------
 RESPUESTAS_CORRECTAS = ['C', 'B', 'A', 'D', 'B', 'B', 'A', 'B', 'D', 'D']
 
-# Umbrales generales
-TH_LINEAS = 150          # umbral de gris para detectar líneas de la grilla y subrayados
-TH_TRAZOS = 200          # umbral más permisivo para letras con antialiasing
-TH_AREA = 4              # área mínima de una componente válida (descarta restos de líneas)
-LARGO_MIN_SUBRAYADO = 20 # largo mínimo (en pixels) de un subrayado
-ALTO_RENGLON = 14        # alto de la franja a analizar por encima de un subrayado
-ESCALA_LETRA = 4         # factor de escalado de la letra antes de binarizar
-TH_RATIO_A_D = 0.30      # ratio área_agujero/área_total que separa la A de la D
-MIN_APROBACION = 6       # cantidad mínima de respuestas correctas para aprobar
-# Hueco mínimo entre palabras relativo al alto de los caracteres (~12 px).
-# Entre palabras hay 6-7 px, pero entre dígitos angostos como "11" hay 5 px.
-FACTOR_ESPACIO = 0.45
 
-# --- 1. Funciones Auxiliares --------------------------------------------------
+# --- 1. Funciones Auxiliares ----------------------------------------------
 
 def imshow(img, new_fig=True, title=None, color_img=False, blocking=False, colorbar=True, ticks=False):
     if new_fig:
@@ -28,7 +16,6 @@ def imshow(img, new_fig=True, title=None, color_img=False, blocking=False, color
         plt.imshow(img)
     else:
         plt.imshow(img, cmap='gray', vmin=0, vmax=255)
-
     if title is not None:
         plt.title(title)
     if not ticks:
@@ -39,306 +26,317 @@ def imshow(img, new_fig=True, title=None, color_img=False, blocking=False, color
         plt.show(block=blocking)
 
 
-def detectar_lineas(proyeccion, umbral):
-    """
-    Recibe una proyección (suma de pixels por fila o por columna) y devuelve
-    una lista de tramos (inicio, fin) donde la proyección supera el umbral.
-    Como las líneas pueden tener más de un pixel de ancho, se agrupan los
-    índices consecutivos en un único tramo.
-    """
-    mascara = (proyeccion > umbral).astype(int)
-    # Los cambios 0->1 marcan inicios y los cambios 1->0 marcan finales
-    cambios = np.diff(np.concatenate([[0], mascara, [0]]))
-    inicios = np.where(cambios == 1)[0]
-    finales = np.where(cambios == -1)[0] - 1
-    return list(zip(inicios, finales))
+def tramos(v):
+    """Pares (inicio, fin) de cada tramo True de un vector booleano."""
+    d = np.diff(np.concatenate([[0], v.astype(int), [0]]))
+    return np.column_stack((np.where(d == 1)[0], np.where(d == -1)[0] - 1))
 
 
-def tramos_horizontales(fila_binaria, largo_min):
-    """
-    Devuelve los tramos (x0, x1) de pixels oscuros consecutivos de una fila
-    binaria cuyo largo sea al menos largo_min (candidatos a subrayado).
-    """
-    return [(x0, x1) for x0, x1 in detectar_lineas(fila_binaria, 0) if x1 - x0 + 1 >= largo_min]
+# --- 2. Detección de la estructura ---------------------------------------
 
+def detectar_estructura(img):
+    """Devuelve la binarización, proyecciones, líneas, celdas y campos."""
+    binaria = (img < 150).astype(np.uint8)
 
-def componentes_validas(recorte, umbral_gris=TH_TRAZOS, th_area=TH_AREA):
-    """
-    Umbraliza el recorte y obtiene sus componentes conectadas, descartando
-    las de área muy chica. Devuelve los stats (x, y, w, h, area) ordenados
-    de izquierda a derecha.
-    """
-    recorte_th = (recorte < umbral_gris).astype(np.uint8)
-    _, _, stats, _ = cv2.connectedComponentsWithStats(recorte_th, 8, cv2.CV_32S)
-    stats = stats[1:]                     # descartamos el fondo
-    ix_area = stats[:, -1] > th_area
-    stats = stats[ix_area, :]
-    return stats[np.argsort(stats[:, 0])]
+    # Proyección sobre columnas: picos = líneas verticales
+    proy_col = binaria.sum(axis=0)
+    lineas_v = tramos(proy_col > 0.5 * proy_col.max())
 
-# --- 2. Detección de la estructura del examen ---------------------------------
+    # La tabla arranca después de la primera línea vertical
+    x_ref = lineas_v[0][1]
+    y_tabla = max(tramos(binaria[:, x_ref]), key=lambda t: t[1] - t[0])[0]
 
-def detectar_grilla(img):
-    """
-    Detecta las 10 celdas de preguntas mediante proyección de pixels.
-    Devuelve la lista de celdas (y0, y1, x0, x1) ordenadas de la pregunta 1
-    a la 10 (primero columna izquierda, luego derecha) y la fila donde
-    comienza la tabla.
-    """
-    img_th_ones = (img < TH_LINEAS).astype(np.uint8)
+    # Proyección sobre filas desde la tabla: picos = líneas horizontales
+    proy_fil = binaria[y_tabla:, :].sum(axis=1)
+    lineas_h = tramos(proy_fil > 0.5 * proy_fil.max()) + y_tabla
 
-    # Líneas verticales: columnas con muchos pixels oscuros
-    img_cols = np.sum(img_th_ones, 0)
-    lineas_v = detectar_lineas(img_cols, 0.5 * img_cols.max())
-
-    # La tabla empieza donde arranca el tramo oscuro más largo de la primera vertical
-    col_ref = lineas_v[0][1]
-    tramos_col = detectar_lineas(img_th_ones[:, col_ref], 0)
-    y_tabla = max(tramos_col, key=lambda t: t[1] - t[0])[0]
-
-    # Líneas horizontales: se proyecta sólo la zona de la tabla (sin el encabezado)
-    img_rows = np.sum(img_th_ones[y_tabla:, :], 1)
-    lineas_h = [(y0 + y_tabla, y1 + y_tabla) for y0, y1 in detectar_lineas(img_rows, 0.5 * img_rows.max())]
-
+    # Armo las 10 celdas (2 columnas x 5 filas)
     celdas = []
     for c in range(2):
-        # Interior de la columna: entre el final de su línea izquierda y el inicio de la derecha
-        x0 = lineas_v[2 * c][1] + 1
-        x1 = lineas_v[2 * c + 1][0]
+        x0, x1 = lineas_v[2 * c][1] + 1, lineas_v[2 * c + 1][0]
         for f in range(5):
-            y0 = lineas_h[f][1] + 1
-            y1 = lineas_h[f + 1][0]
+            y0, y1 = lineas_h[f][1] + 1, lineas_h[f + 1][0]
             celdas.append((y0, y1, x0, x1))
-    return celdas, y_tabla
+
+    # Encabezado: la línea horizontal más larga en la zona superior
+    enc = binaria[:y_tabla, :]
+    y_linea = int(np.argmax(enc.sum(axis=1)))
+    campos_v = tramos(enc[y_linea, :] > 0)
+    campos = dict(zip(['Name', 'Date', 'Class'],
+                      [t for t in campos_v if (t[1] - t[0]) > 20]))
+
+    return binaria, proy_col, lineas_v, proy_fil, lineas_h, celdas, y_linea, campos
 
 
-def detectar_campos_encabezado(img, y_tabla):
-    """
-    Detecta los campos Name, Date y Class del encabezado. En la zona por
-    encima de la tabla, la fila con mayor proyección es la de los subrayados,
-    y cada tramo largo de esa fila corresponde a un campo.
-    Devuelve la fila del subrayado y un diccionario campo -> (x0, x1).
-    """
-    encabezado_th = (img[:y_tabla, :] < TH_LINEAS).astype(np.uint8)
-    img_rows = np.sum(encabezado_th, 1)
-    y_linea = int(np.argmax(img_rows))
+# --- 3. Corrección de una celda ------------------------------------------
 
-    tramos = tramos_horizontales(encabezado_th[y_linea], LARGO_MIN_SUBRAYADO)
-    campos = dict(zip(['Name', 'Date', 'Class'], tramos))
-    return y_linea, campos
+def corregir_celda(celda):
+    """Devuelve (letra, renglon, letra_recortada, letra_binaria)."""
+    binaria = (celda < 150).astype(np.uint8)
 
+    # Busco el subrayado: tramo horizontal más largo
+    sub = None
+    for y in range(binaria.shape[0]):
+        largos = [t for t in tramos(binaria[y]) if (t[1] - t[0]) >= 20]
+        if largos:
+            sub = (y, largos[0][0], largos[0][1]); break
+    if sub is None:
+        return '-', None, None, None
+    y_sub, x0, x1 = sub
 
-def recortar_sobre_subrayado(img, y_linea, x0, x1, alto=ALTO_RENGLON):
-    """
-    Recorta la franja de alto 'alto' ubicada justo encima de un subrayado,
-    sin incluir la línea del subrayado.
-    """
-    return img[max(0, y_linea - alto):y_linea - 1, x0:x1 + 1]
+    # Recorto la zona justo encima del subrayado
+    renglon = celda[max(0, y_sub - 14):y_sub - 1, x0:x1 + 1]
 
-# --- 3. Corrección de respuestas (punto a) ------------------------------------
+    # Componentes conectadas: descarto las de área pequeña
+    _, _, stats, _ = cv2.connectedComponentsWithStats((renglon < 200).astype(np.uint8), 8, cv2.CV_32S)
+    validas = [stats[i] for i in range(1, len(stats)) if stats[i, cv2.CC_STAT_AREA] > 4]
 
-def detectar_respuesta(celda):
-    """
-    Busca el espacio en blanco (subrayado) de la celda y analiza las
-    componentes conectadas escritas sobre él.
-    Devuelve None si no hay respuesta, 'MULTIPLE' si hay más de una marca,
-    o el recorte de la letra si hay exactamente una.
-    """
-    celda_th = (celda < TH_LINEAS).astype(np.uint8)
+    if len(validas) == 0: return '-', renglon, None, None
+    if len(validas) > 1:  return 'MULTIPLE', renglon, None, None
 
-    # El primer tramo horizontal largo de la celda es el subrayado del enunciado
-    subrayado = None
-    for y in range(celda_th.shape[0]):
-        tramos = tramos_horizontales(celda_th[y], LARGO_MIN_SUBRAYADO)
-        if tramos:
-            subrayado = (y, tramos[0][0], tramos[0][1])
-            break
-    if subrayado is None:
-        return None
+    x, y, w, h, _ = validas[0]
+    letra = renglon[max(0, y - 2):y + h + 2, max(0, x - 2):x + w + 2]
+    if letra.size == 0: return '-', renglon, None, None
 
-    y, x0, x1 = subrayado
-    renglon = recortar_sobre_subrayado(celda, y, x0, x1)
-    stats = componentes_validas(renglon)
+    # Clasificación por cantidad y tamaño de agujeros internos
+    letra_bin = (cv2.resize(letra, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC) < 200).astype(np.uint8) * 255
+    contornos, jer = cv2.findContours(letra_bin, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if jer is None: return '-', renglon, letra, letra_bin
+    jer = jer[0]
 
-    if len(stats) == 0:
-        return None
-    if len(stats) > 1:
-        return 'MULTIPLE'
-
-    # Recorte de la única letra con un pequeño margen
-    x, yy, w, h, _ = stats[0]
-    margen = 2
-    return renglon[max(0, yy - margen):yy + h + margen, max(0, x - margen):x + w + margen]
-
-
-def clasificar_letra(recorte):
-    """
-    Identifica la letra (A, B, C o D) según la cantidad de agujeros:
-    C = 0, B = 2, A y D = 1 (se distinguen por el ratio área_agujero/área_total,
-    que es mayor en la D).
-    Como las letras son muy chicas y con antialiasing, primero se escala el
-    recorte y se binariza con un umbral permisivo.
-    """
-    recorte_grande = cv2.resize(recorte, None, fx=ESCALA_LETRA, fy=ESCALA_LETRA,
-                                interpolation=cv2.INTER_CUBIC)
-    letra_bin = (recorte_grande < TH_TRAZOS).astype(np.uint8) * 255
-
-    contornos, jerarquia = cv2.findContours(letra_bin, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    jerarquia = jerarquia[0]
-
-    # Contorno externo principal (sin padre) y sus agujeros (hijos)
-    externos = [i for i in range(len(contornos)) if jerarquia[i][3] == -1]
+    externos = [i for i in range(len(contornos)) if jer[i][3] == -1]
+    if not externos: return '-', renglon, letra, letra_bin
     principal = max(externos, key=lambda i: cv2.contourArea(contornos[i]))
-    agujeros = [i for i in range(len(contornos)) if jerarquia[i][3] == principal]
+    agujeros = [i for i in range(len(contornos)) if jer[i][3] == principal]
 
-    if len(agujeros) == 0:
-        return 'C'
-    if len(agujeros) >= 2:
-        return 'B'
+    if len(agujeros) == 0:      r = 'C'        # sin agujeros
+    elif len(agujeros) >= 2:    r = 'B'        # dos agujeros
+    else:
+        ratio = cv2.contourArea(contornos[agujeros[0]]) / cv2.contourArea(contornos[principal])
+        r = 'D' if ratio > 0.3 else 'A'        # agujero grande / chico
 
-    area_agujero = cv2.contourArea(contornos[agujeros[0]])
-    area_total = cv2.contourArea(contornos[principal])
-    ratio = area_agujero / area_total
-    return 'D' if ratio > TH_RATIO_A_D else 'A'
+    return r, renglon, letra, letra_bin
 
 
-def corregir_examen(img):
-    """
-    Corrige las 10 preguntas del examen. Devuelve una lista de booleanos
-    (True = correcta) y la lista de respuestas detectadas.
-    """
-    celdas, _ = detectar_grilla(img)
-    resultados = []
-    respuestas = []
-    for i, (y0, y1, x0, x1) in enumerate(celdas):
-        respuesta = detectar_respuesta(img[y0:y1, x0:x1])
-        if respuesta is None:
-            letra = '-'             # sin respuesta
-        elif isinstance(respuesta, str):
-            letra = respuesta       # múltiple marcada
-        else:
-            letra = clasificar_letra(respuesta)
-        respuestas.append(letra)
-        resultados.append(letra == RESPUESTAS_CORRECTAS[i])
-    return resultados, respuestas
+# --- 4. Validación del encabezado ----------------------------------------
 
-# --- 4. Validación del encabezado (punto b) -----------------------------------
+def validar_campos(img, y_linea, campos):
+    """Valida Name, Date y Class según las restricciones del enunciado."""
+    estados, recortes, recorte_name = {}, {}, None
 
-def contar_caracteres_y_palabras(recorte):
-    """
-    Cuenta los caracteres de un campo como componentes conectadas, y las
-    palabras como grupos de caracteres separados por un espacio (un hueco
-    horizontal mayor a FACTOR_ESPACIO veces el alto típico de los caracteres).
-    """
-    stats = componentes_validas(recorte)
-    n_caracteres = len(stats)
-    if n_caracteres == 0:
-        return 0, 0
-
-    alto_tipico = np.median(stats[:, 3])
-    fin_anterior = stats[:-1, 0] + stats[:-1, 2]
-    huecos = stats[1:, 0] - fin_anterior
-    n_palabras = 1 + int(np.sum(huecos > FACTOR_ESPACIO * alto_tipico))
-    return n_caracteres, n_palabras
-
-
-def validar_encabezado(img):
-    """
-    Valida los campos del encabezado:
-      Name: al menos dos palabras y no más de 25 caracteres.
-      Date: 8 caracteres formando una sola palabra.
-      Class: un único caracter.
-    Devuelve un diccionario campo -> bool y el recorte del campo Name.
-    """
-    _, y_tabla = detectar_grilla(img)
-    y_linea, campos = detectar_campos_encabezado(img, y_tabla)
-
-    estados = {}
     for campo, (x0, x1) in campos.items():
-        recorte = recortar_sobre_subrayado(img, y_linea, x0, x1, alto=y_linea)
-        n_car, n_pal = contar_caracteres_y_palabras(recorte)
+        renglon = img[0:y_linea - 1, x0:x1 + 1]
+        recortes[campo] = renglon
+
+        _, _, stats, _ = cv2.connectedComponentsWithStats((renglon < 200).astype(np.uint8), 8, cv2.CV_32S)
+        letras = [stats[i] for i in range(1, len(stats)) if stats[i, cv2.CC_STAT_AREA] > 4]
+        letras.sort(key=lambda s: s[0])
+
+        n = len(letras)
+        if n == 0:
+            estados[campo] = False
+            continue
+
+        # Cuento palabras por los huecos grandes entre letras consecutivas
+        alto = np.median([s[3] for s in letras])
+        palabras = 1 + sum(1 for i in range(1, n)
+                           if (letras[i][0] - (letras[i - 1][0] + letras[i - 1][2])) > 0.45 * alto)
+
         if campo == 'Name':
-            estados[campo] = n_pal >= 2 and n_car <= 25
+            estados[campo] = (palabras >= 2) and (n <= 25)
+            recorte_name = img[0:y_linea + 3, x0:x1 + 1]
         elif campo == 'Date':
-            estados[campo] = n_car == 8 and n_pal == 1
-        else:
-            estados[campo] = n_car == 1
+            estados[campo] = (n == 8) and (palabras == 1)
+        elif campo == 'Class':
+            estados[campo] = (n == 1)
 
-    x0, x1 = campos['Name']
-    recorte_name = img[0:y_linea + 3, x0:x1 + 1]
-    return estados, recorte_name
+    return estados, recortes, recorte_name
 
-# --- 5. Informe de aprobados (punto d) ----------------------------------------
 
-def generar_informe(recortes_name, aprobados, ruta_salida):
-    """
-    Genera una única imagen con los recortes del campo Name de todos los
-    exámenes, con borde verde y leyenda APROBADO para los aprobados, y borde
-    rojo y leyenda DESAPROBADO para los desaprobados.
-    """
-    escala = 2
-    ancho_leyenda = 260
+# --- 5. Informe final -----------------------------------------------------
+
+def generar_informe(recortes, aprobados):
+    """Apila los crops del campo Name con su estado."""
     filas = []
-    for recorte, aprobado in zip(recortes_name, aprobados):
-        color = (0, 170, 0) if aprobado else (0, 0, 220)   # BGR
-        leyenda = 'APROBADO' if aprobado else 'DESAPROBADO'
+    for recorte, apro in zip(recortes, aprobados):
+        color = (0, 170, 0) if apro else (0, 0, 220)
+        txt = 'APROBADO' if apro else 'DESAPROBADO'
 
-        name = cv2.resize(recorte, None, fx=escala, fy=escala, interpolation=cv2.INTER_CUBIC)
-        name = cv2.cvtColor(name, cv2.COLOR_GRAY2BGR)
+        fila = cv2.cvtColor(cv2.resize(recorte, None, fx=2, fy=2), cv2.COLOR_GRAY2BGR)
+        fila = cv2.copyMakeBorder(fila, 0, 0, 0, 260, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+        cv2.putText(fila, txt, (fila.shape[1] - 245, fila.shape[0] // 2 + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+        fila = cv2.copyMakeBorder(fila, 6, 6, 6, 6, cv2.BORDER_CONSTANT, value=color)
+        fila = cv2.copyMakeBorder(fila, 8, 8, 8, 8, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+        filas.append(fila)
 
-        # Espacio a la derecha para la leyenda
-        name = cv2.copyMakeBorder(name, 0, 0, 0, ancho_leyenda, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-        cv2.putText(name, leyenda, (name.shape[1] - ancho_leyenda + 15, name.shape[0] // 2 + 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
-
-        # Borde de color que identifica el estado y separación blanca entre filas
-        name = cv2.copyMakeBorder(name, 6, 6, 6, 6, cv2.BORDER_CONSTANT, value=color)
-        name = cv2.copyMakeBorder(name, 8, 8, 8, 8, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-        filas.append(name)
-
-    # Igualamos anchos antes de apilar verticalmente
-    ancho_max = max(f.shape[1] for f in filas)
-    filas = [cv2.copyMakeBorder(f, 0, 0, 0, ancho_max - f.shape[1], cv2.BORDER_CONSTANT,
+    w = max(f.shape[1] for f in filas)
+    filas = [cv2.copyMakeBorder(f, 0, 0, 0, w - f.shape[1], cv2.BORDER_CONSTANT,
                                 value=(255, 255, 255)) for f in filas]
-    informe = np.vstack(filas)
+    return np.vstack(filas)
 
-    os.makedirs(os.path.dirname(ruta_salida), exist_ok=True)
-    cv2.imwrite(ruta_salida, informe)
-    return informe
 
-# --- 6. Ejecución y Resultados (punto c) --------------------------------------
+# --- 6. Ejecución Principal ----------------------------------------------
 
 if __name__ == '__main__':
-    # Se ejecuta desde la raíz del repositorio
-    rutas_examenes = [f'./Imagenes/Iniciales/examen_{i}.png' for i in range(1, 6)]
-    ruta_informe = './Imagenes/Resultados/Problema_2/informe_aprobados.png'
+    rutas = [f'./Imagenes/Iniciales/examen_{i}.png' for i in range(1, 6)]
 
-    recortes_name = []
-    aprobados = []
+    recortes, aprobados = [], []
 
-    for ruta in rutas_examenes:
-        # Cargamos el examen en escala de grises (única entrada del algoritmo)
+    for idx, ruta in enumerate(rutas):
         img = cv2.imread(ruta, cv2.IMREAD_GRAYSCALE)
-        print(f"\n--- {os.path.basename(ruta)} ---")
+        if img is None:
+            continue
 
-        # 6.1 Corrección de las preguntas
-        resultados, respuestas = corregir_examen(img)
-        for i, correcta in enumerate(resultados):
-            print(f"Pregunta {i + 1}: {'OK' if correcta else 'MAL'}")
+        print(f"\n===== examen_{idx+1}.png =====")
 
-        # 6.2 Validación del encabezado
-        estados, recorte_name = validar_encabezado(img)
+        # --- PASO 1: estructura de la tabla -------------------------
+        binaria, proy_col, lineas_v, proy_fil, lineas_h, celdas, y_linea, campos = detectar_estructura(img)
+
+        plt.figure(figsize=(11, 7))
+        plt.suptitle(f'examen_{idx+1} — Paso 1: Detección de la estructura', fontsize=12)
+
+        plt.subplot(2, 2, 1)
+        imshow(img, new_fig=False, title='1) Imagen original')
+
+        plt.subplot(2, 2, 2)
+        imshow(binaria * 255, new_fig=False, title='2) Imagen binarizada (img < 150)')
+
+        plt.subplot(2, 2, 3)
+        plt.plot(proy_col); plt.title('3) Proyección sobre columnas')
+        plt.xticks([]); plt.yticks([])
+
+        plt.subplot(2, 2, 4)
+        plt.plot(proy_fil); plt.title('4) Proyección sobre filas')
+        plt.xticks([]); plt.yticks([])
+
+        plt.tight_layout()
+        plt.show(block=True)
+
+        # --- PASO 2: líneas y celdas --------------------------------
+        plt.figure(figsize=(15, 6))
+        plt.suptitle(f'examen_{idx+1} — Paso 2: Líneas y celdas detectadas', fontsize=12)
+
+        ax1 = plt.subplot(1, 3, 1)
+        imshow(img, new_fig=False, title='1) Líneas verticales')
+        for v in lineas_v:
+            plt.axvline(v[0], color='r', lw=1)
+            plt.axvline(v[1], color='r', lw=1)
+
+        plt.subplot(1, 3, 2, sharex=ax1, sharey=ax1)
+        imshow(img, new_fig=False, title='2) Líneas horizontales')
+        for h in lineas_h:
+            plt.axhline(h[0], color='g', lw=1)
+            plt.axhline(h[1], color='g', lw=1)
+
+        plt.subplot(1, 3, 3, sharex=ax1, sharey=ax1)
+        imshow(img, new_fig=False, title='3) Celdas (amarillo) y campos (azul)')
+        ax = plt.gca()
+        for (y0, y1, x0, x1) in celdas:
+            ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor='y', lw=1.5))
+        for (x0, x1) in campos.values():
+            ax.add_patch(Rectangle((x0, y_linea - 15), x1 - x0, 15, fill=False, edgecolor='b', lw=1.5))
+
+        plt.tight_layout()
+        plt.show(block=True)
+
+        # --- PASO 3: validación del encabezado ----------------------
+        estados, recortes_campos, recorte_name = validar_campos(img, y_linea, campos)
+
+        plt.figure(figsize=(15, 4))
+        plt.suptitle(f'examen_{idx+1} — Paso 3: Validación del encabezado', fontsize=12)
+
+        ax1 = plt.subplot(1, 4, 1)
+        imshow(img[:y_linea + 3, :], new_fig=False, title='Encabezado completo')
+        for (x0, x1) in campos.values():
+            ax1.add_patch(Rectangle((x0, 0), x1 - x0, y_linea + 3, fill=False, edgecolor='r', lw=1.5))
+
+        for i, (campo, rec) in enumerate(recortes_campos.items()):
+            estado = 'OK' if estados[campo] else 'MAL'
+            plt.subplot(1, 4, i + 2)
+            imshow(rec, new_fig=False, title=f'{campo}: {estado}')
+
+        plt.tight_layout()
+        plt.show(block=True)
+
+        # --- PASO 4: clasificación de las 10 celdas -----------------
+        letras_detectadas, detalles_primera = [], None
+        for i, (y0, y1, x0, x1) in enumerate(celdas):
+            letra, renglon, letra_r, letra_b = corregir_celda(img[y0:y1, x0:x1])
+            letras_detectadas.append(letra)
+            if i == 0:
+                detalles_primera = (img[y0:y1, x0:x1], renglon, letra_r, letra_b, letra)
+
+        plt.figure(figsize=(15, 6))
+        plt.suptitle(f'examen_{idx+1} — Paso 4: Clasificación de las 10 celdas', fontsize=12)
+        for i, (y0, y1, x0, x1) in enumerate(celdas):
+            r = letras_detectadas[i]
+            esperada = RESPUESTAS_CORRECTAS[i]
+            color = 'green' if r == esperada else 'red'
+            ax = plt.subplot(2, 5, i + 1)
+            imshow(img[y0:y1, x0:x1], new_fig=False, title=f'P{i+1}: {r} (esp. {esperada})')
+            ax.title.set_color(color)
+        plt.tight_layout()
+        plt.show(block=True)
+
+        # --- PASO 5: proceso interno de una celda -------------------
+        celda0, renglon0, letra0, letra_bin0, r0 = detalles_primera
+        plt.figure(figsize=(15, 4))
+        plt.suptitle(f'examen_{idx+1} — Paso 5: Proceso interno de clasificación (celda 1)', fontsize=12)
+
+        plt.subplot(1, 4, 1)
+        imshow(celda0, new_fig=False, title='1) Celda recortada')
+
+        plt.subplot(1, 4, 2)
+        if renglon0 is not None:
+            imshow(renglon0, new_fig=False, title='2) Renglón (zona sobre el subrayado)')
+
+        plt.subplot(1, 4, 3)
+        if letra0 is not None:
+            imshow(letra0, new_fig=False, title='3) Letra aislada')
+
+        plt.subplot(1, 4, 4)
+        if letra_bin0 is not None:
+            imshow(letra_bin0, new_fig=False, title=f'4) Clasificación: {r0}')
+
+        plt.tight_layout()
+        plt.show(block=True)
+
+        # --- PASO 6: resultado del examen --------------------------
+        resultados = [letras_detectadas[i] == RESPUESTAS_CORRECTAS[i] for i in range(10)]
+        aprobado = sum(resultados) >= 6
+
+        for i, ok in enumerate(resultados):
+            print(f"Pregunta {i+1:02d}: {'OK' if ok else 'MAL'} (detectado: {letras_detectadas[i]})")
         for campo, valido in estados.items():
             print(f"{campo}: {'OK' if valido else 'MAL'}")
+        print(f"Correctas: {sum(resultados)}/10 -> {'APROBADO' if aprobado else 'DESAPROBADO'}")
 
-        n_correctas = sum(resultados)
-        aprobado = n_correctas >= MIN_APROBACION
-        print(f"Respuestas detectadas: {' '.join(respuestas)}")
-        print(f"Correctas: {n_correctas}/10 -> {'APROBADO' if aprobado else 'DESAPROBADO'}")
+        plt.figure(figsize=(9, 11))
+        estado_txt = 'APROBADO' if aprobado else 'DESAPROBADO'
+        color_txt = 'green' if aprobado else 'red'
+        plt.suptitle(f'examen_{idx+1} — Resultado: {estado_txt}  ({sum(resultados)}/10)', color=color_txt, fontsize=13)
+        ax = plt.gca()
+        imshow(img, new_fig=False, title=None)
+        for i, (y0, y1, x0, x1) in enumerate(celdas):
+            ok = resultados[i]
+            color = 'lime' if ok else 'red'
+            ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor=color, lw=2))
+            ax.text(x1 + 4, (y0 + y1) / 2, f'{i+1}: {letras_detectadas[i]} {"OK" if ok else "X"}',
+                    color=color, fontsize=9, va='center')
+        plt.tight_layout()
+        plt.show(block=True)
 
-        recortes_name.append(recorte_name)
+        # Guardo datos para el informe final
+        recortes.append(recorte_name)
         aprobados.append(aprobado)
 
-    # 6.3 Imagen de salida con los Name de aprobados y desaprobados
-    informe = generar_informe(recortes_name, aprobados, ruta_informe)
-    imshow(cv2.cvtColor(informe, cv2.COLOR_BGR2RGB), title="Informe de aprobados",
-           color_img=True, colorbar=False, blocking=True)
+    # --- Informe final -----------------------------------------------
+    if recortes:
+        informe = generar_informe(recortes, aprobados)
+        plt.figure(figsize=(9, 2 * len(recortes)))
+        plt.imshow(cv2.cvtColor(informe, cv2.COLOR_BGR2RGB))
+        plt.title('Informe final — aprobados y desaprobados')
+        plt.axis('off')
+        plt.tight_layout()
+        plt.show(block=True)
